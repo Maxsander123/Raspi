@@ -1,0 +1,185 @@
+import RPi.GPIO as GPIO
+import time
+import pygame
+import math
+import threading
+
+# GPIO setup
+TRIG = 23
+ECHO = 24
+SERVO_PIN = 17
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(TRIG, GPIO.OUT)
+GPIO.setup(ECHO, GPIO.IN)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+servo = GPIO.PWM(SERVO_PIN, 50)
+servo.start(0)
+
+# Constants
+WIDTH, HEIGHT = 600, 600
+CENTER = (WIDTH // 2, HEIGHT // 2)
+RADIUS = 250
+SCAN_SPEED = 0.05
+
+# Radar mode
+radar_mode = "sweep"  # Options: sweep, search, track
+track_angle = 90
+tracking = False
+tracking_window = 10  # degrees to each side of target
+track_direction = 1
+
+distances = {}
+angle_lock = threading.Lock()
+current_angle = 0
+
+# Pygame GUI setup
+pygame.init()
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("DIY Radar")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont("Arial", 20)
+
+def set_servo_angle(angle):
+    duty = 2 + (angle / 18)
+    servo.ChangeDutyCycle(duty)
+    time.sleep(0.05)
+    servo.ChangeDutyCycle(0)
+
+def get_distance():
+    GPIO.output(TRIG, False)
+    time.sleep(0.01)
+    GPIO.output(TRIG, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG, False)
+
+    pulse_start, pulse_end = 0, 0
+    timeout = time.time() + 0.04
+    while GPIO.input(ECHO) == 0 and time.time() < timeout:
+        pulse_start = time.time()
+    while GPIO.input(ECHO) == 1 and time.time() < timeout:
+        pulse_end = time.time()
+
+    if pulse_end == 0 or pulse_start == 0:
+        return -1
+
+    pulse_duration = pulse_end - pulse_start
+    distance = pulse_duration * 17150
+    return round(distance, 2)
+
+def radar_logic():
+    global current_angle, tracking, track_direction, track_angle
+    direction = 1
+
+    while True:
+        with angle_lock:
+            if radar_mode == "sweep":
+                current_angle += direction
+                if current_angle >= 180 or current_angle <= 0:
+                    direction *= -1
+            elif radar_mode == "search":
+                current_angle = (current_angle + 10) % 181
+            elif radar_mode == "track":
+                if not tracking:
+                    current_angle = track_angle
+                    tracking = True
+                    track_direction = 1
+                else:
+                    current_angle += track_direction
+                    if current_angle >= track_angle + tracking_window:
+                        track_direction = -1
+                    elif current_angle <= track_angle - tracking_window:
+                        track_direction = 1
+
+        set_servo_angle(current_angle)
+        dist = get_distance()
+        with angle_lock:
+            distances[current_angle] = dist
+        time.sleep(SCAN_SPEED)
+
+def draw_radar():
+    screen.fill((0, 0, 0))
+    pygame.draw.circle(screen, (0, 255, 0), CENTER, RADIUS, 1)
+    for r in range(50, RADIUS, 50):
+        pygame.draw.circle(screen, (0, 100, 0), CENTER, r, 1)
+
+    for a in range(0, 360, 30):
+        rad = math.radians(a)
+        x = CENTER[0] + RADIUS * math.cos(rad)
+        y = CENTER[1] - RADIUS * math.sin(rad)
+        pygame.draw.line(screen, (0, 100, 0), CENTER, (x, y), 1)
+
+    with angle_lock:
+        sweep_angle = current_angle
+    rad = math.radians(sweep_angle)
+    x = CENTER[0] + RADIUS * math.cos(math.radians(180 - sweep_angle))
+    y = CENTER[1] + RADIUS * math.sin(math.radians(180 - sweep_angle))
+    pygame.draw.line(screen, (0, 255, 0), CENTER, (x, y), 2)
+
+    for a, d in distances.items():
+        if d > 0 and d < 250:
+            dx = CENTER[0] + d * math.cos(math.radians(180 - a))
+            dy = CENTER[1] + d * math.sin(math.radians(180 - a))
+            pygame.draw.circle(screen, (255, 0, 0), (int(dx), int(dy)), 4)
+
+    text = font.render(f"Mode: {radar_mode.upper()}", True, (0, 255, 0))
+    screen.blit(text, (10, 10))
+
+    if radar_mode == "track":
+        text2 = font.render(f"Tracking angle: {track_angle}", True, (255, 255, 0))
+        screen.blit(text2, (10, 35))
+
+    pygame.display.flip()
+
+def get_angle_from_click(pos):
+    dx = pos[0] - CENTER[0]
+    dy = pos[1] - CENTER[1]
+    angle = math.degrees(math.atan2(dy, -dx))
+    angle = (angle + 360) % 360
+    if angle <= 180:
+        return int(180 - angle)
+    return -1  # Ignore clicks outside radar scan arc
+
+# Start radar logic thread
+t = threading.Thread(target=radar_logic)
+t.daemon = True
+t.start()
+
+# Main loop
+running = True
+while running:
+    screen.fill((0, 0, 0))
+    draw_radar()
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_1:
+                radar_mode = "sweep"
+                tracking = False
+            elif event.key == pygame.K_2:
+                radar_mode = "search"
+                tracking = False
+            elif event.key == pygame.K_3:
+                radar_mode = "track"
+                tracking = False
+            elif event.key == pygame.K_LEFT and radar_mode == "track":
+                track_angle = max(10, track_angle - 5)
+                tracking = False
+            elif event.key == pygame.K_RIGHT and radar_mode == "track":
+                track_angle = min(170, track_angle + 5)
+                tracking = False
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            clicked_angle = get_angle_from_click(event.pos)
+            if clicked_angle != -1:
+                radar_mode = "track"
+                track_angle = clicked_angle
+                tracking = False
+
+    clock.tick(30)
+
+# Cleanup
+servo.stop()
+GPIO.cleanup()
+pygame.quit()
